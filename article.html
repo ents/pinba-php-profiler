@@ -1,0 +1,159 @@
+<style>
+	pre.code {
+		font-family: monospace;
+		padding: 10px;
+		border: solid 1px #ddd;
+		background: #eee;
+		overflow: auto;
+	}
+</style>
+
+<title>Профилирование PHP скриптов на живом сервере</title>
+
+<div style="margin: auto; width: 800px">
+<p>Добрый день, сообщество!</p>
+
+<p>Наверняка кто-то из вас сталкивался с такой проблемой - медленно работает сайт на реальном сервере.</p>
+<p>Важно оперативно выяснить в каких местах возникли сложности. Использовать для этого xdebug нельзя, так как он создает большую нагрузку на сервер и сам вносит погрешность в измерения. Для решения этой задачи мы выбрали систему, которая позволяет очень быстро собирать древовидную статистику по работе сайта - pinba.</p>
+
+<p>На хабре уже рассказывали о специфике работы с <a href="http://habrahabr.ru/post/129042/">pinba</a>. Если вы не читали, можете ознакомиться по ссылке. </p>
+
+<p>Для нетерпеливых сразу дам ссылку на <a href="http://profiler.public.oemtest.ru/?script_name=simpleJsBanner">результат</a>.
+Cистема работает в штатном режиме при нагрузке около 1000 запросов в секунду.</p>
+
+<h4>Как это все работает ?</h4>
+
+<h5>Сбор данных</h5>
+<b>Pinba</b> отправляет на свой сервер (по UDP, очень быстро) метки начала и конца отрезка времени (далее - таймеры) и складывает данные в MySQL таблицы (легко прочитать). Например
+<pre class="code">
+$timer = pinba_timer_start(array('tag' => 'some_logic'));
+....
+pinba_timer_stop($timer);
+</pre>
+Для построения древовидной структуры мы добавляем 2 дополнительных тега - tree_id (каждый раз уникальный id) и tree_parent_id - это tree_id от того таймера, в который вложен текущий. Например
+
+<pre class="code">
+$parent_timer = pinba_timer_start(array('tag' =>'some_logic', 'tree_id' => 1, 'tree_parent_id' => 'root'));
+
+   $child_timer = pinba_timer_start(array('tag' =>'child_logic', 'tree_id' => 2, 'tree_parent_id' => 1));
+   pinba_timer_stop($child_timer);
+
+pinba_timer_stop($parent_timer);
+</pre>
+Таким образом, на сервере можно воспроизвести вложенность таймеров и построить удобочитаемое дерево.
+Мы разместили во всех интересных местах проекта таймеры, чтобы засекать время (например, при sql запросах, при записи в файлы и т.д.).
+
+<h5>Подготовка данных</h5>
+К сожалению, pinba не использует индексы для запросов (кроме PRIMARY), так как используется свой pinba ENGINE (таблицы фактически хранятся в memory, и данные старше N минут удаляются, в моем случае - 5 минут). Но нельзя сетовать на pinba, так как она предназначена не для запросов по индексам.
+Для нас индексы важны, потому мы копируем все данные из таблиц pinba в обычные MyISAM таблицы.
+
+<pre class="code sql">
+truncate table pinba_cache.request;
+truncate table pinba_cache.tag;
+truncate table pinba_cache.timer;
+truncate table pinba_cache.timertag;
+
+insert ignore into pinba_cache.request select * from pinba.request;
+insert ignore into pinba_cache.tag select * from pinba.tag;
+insert ignore into pinba_cache.timer select * from pinba.timer;
+insert ignore into pinba_cache.timertag select * from pinba.timertag;
+</pre>
+Как видно из запросов, у нас система работает в базе pinba, а копия - в базе pinba_cache.
+
+Так же для работы нам понадобится ещё одна таблица, в которой будут поля tree_id и tree_parent_id.
+
+<pre class="code sql">
+truncate table pinba_cache.timer_tag_tree;
+insert ignore into pinba_cache.timer_tag_tree
+SELECT * FROM (
+	SELECT null, timer_id, request_id, hit_count, timer.value, GROUP_CONCAT(timertag.value) as tags
+	, (select timertag.value from pinba_cache.timertag where timertag.timer_id=timer.id and tag_id = (select id from pinba_cache.tag where name='treeId')) as tree_id
+	, (select timertag.value from pinba_cache.timertag where timertag.timer_id=timer.id and tag_id = (select id from pinba_cache.tag where name='treeParentId')) as tree_parent_id
+	FROM pinba_cache.timertag force index (timer_id)
+	LEFT JOIN pinba_cache.timer ON timertag.timer_id=timer.id
+	where not tag_id in ((select id from pinba_cache.tag where name='treeId'), (select id from pinba_cache.tag where name='treeParentId'))
+	group by timertag.timer_id
+	order by timer_id
+) as tmp
+GROUP BY tree_id;
+</pre>
+
+Структура таблицы timer_tag_tree приведена ниже. Структура остальных таблиц такая же как в pinba.
+<pre class="code sql">
+CREATE TABLE `timer_tag_tree` (
+	`id` INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+	`timer_id` INT(10) NOT NULL DEFAULT '0',
+	`request_id` INT(10) NULL DEFAULT NULL,
+	`hit_count` INT(10) NULL DEFAULT NULL,
+	`value` FLOAT NULL DEFAULT NULL,
+	`tags` VARCHAR(128) NULL DEFAULT NULL,
+	`tree_id` VARCHAR(35) NOT NULL DEFAULT '',
+	`tree_parent_id` VARCHAR(35) NOT NULL DEFAULT '',
+	PRIMARY KEY (`id`),
+	INDEX `timer_id` (`timer_id`),
+	INDEX `tree_id_tree_parent_id` (`tree_id`, `tree_parent_id`),
+	INDEX `tree_parent_id_tree_id` (`tree_parent_id`, `tree_id`)
+)
+COLLATE='utf8_general_ci'
+ENGINE=MyISAM
+</pre>
+
+<h5>Анализ данных</h5>
+Теперь - самое интересное. Мы собрали данные, сложили их в удобном нам виде. Далее необходимо написать скрипт, который все эти данные выдаст в удобном виде.
+Как вывести одно дерево (от одного запроса к сайту) - писать не буду, так как это тривиальная задача.
+Проблема в том, что для оценки узких мест нужно проанализировать сотни запросов к php, каждый из которых имеет свое дерево вызова функций (таймеров). Нам нужно из этих деревьев собрать одно обобщенное дерево.
+
+Алгоритм объединения следующий :
+<img src="http://habrastorage.org/storage2/4c2/ebf/b9b/4c2ebfb9b8df7cb8fd880d2833429c6c.png" /><br />
+Для каждого узла считаем сумму времен выполнения этого узла по всем деревьям
+Написав функцию для объединения двух деревьев, можно пройтись циклом по всем и получить сумму.
+Но тут нас ждет неприятный сюрприз - медленное время работы.
+Как видим из картинки, сложность объединения 2 деревьев - O(N*N) (внимательные мне подскажут что можно сделать это за N*log(N), но далее будет более простой метод оптимизации, в 3 строчки), где N - к-во узлов в дереве. Соответственно выгодно объединять маленькие деревья, и очень невыгодно большие.
+Постараемся эту особенность использовать. Давайте определим дерево выполнения одного скрипта как дерево 1 уровня, сумма двух деревьев первого уровня - дерево второго уровня и т.д. В таких терминах нам нужно объединять побольше деревьев первого уровня, и минимум большого уровня. Делать это будем так:
+
+
+
+как видим, суммарное к-во объединений было N-1, из которых N/2 - первого уровня, N/4 - второго уровня, N/8 - третьего и т.д.
+Реализуется эта хитрость крайне просто с помощью рекурсии (при желании её можно разложить в цикл, но для большей понятности я этого делать не буду).
+
+<pre class="code sql">
+//принимает на вход массив деревьев, на выход - объединенное дерево
+function mergeTreeList(array $treeList) {
+    if (count($treeList) > 2) {
+        return mergeTreeList( половина($treeList), вторая_половина($treeList));
+    }
+    //...
+    //тут идет код объединения
+}
+</pre>
+Таким образом, мы сначала объединим изначальные деревья в 2х, а потом уже их будет объединять в деревья побольше.  Выигрыш по времени у меня составил в ~10 раз (1000 деревьев).
+
+<h4>Итого</h4>
+<ul>
+	<li>Мы разместили pinba-таймерами в нашем приложении, где посчитали нужным </li>
+	<li>Мы сформировали агрегированное дерево выполнения на основании многих запросов к скриптам</li>
+	<li>По построенному дереву можно анализировать узкие места проекта, можно строить графики скорости выполнения отдельных кусков проекта</li>
+	<li>Все это происходит прямо на живом сервере с большой нагрузкой</li>
+</ul>
+
+<h4>Подводные камни и минусы</h4>
+<ul>
+	<li>
+		На нашем проекте пинба так быстро пишет (и удаляет старое), что запрос <b>insert into table_copy select * from table</b> копирует в 2-3 раза больше данных, чем изначально было в таблице. Потому на время копирования таблиц нужно останавливать запись в pinba (я останавливал сеть на сервере фаерволом)
+	</li>
+	<li>Pinba потребляет много памяти (у меня - 2 Gb чтобы хранить данные за 5 минут), так как мы вместо одного тега пишем 3 (+tree_id, +tree_parent_id)</li>
+	<li>При копировании приходится отключать сеть, чтобы остановить запись в таблицы (на 5-10 секунд), из-за чего теряются данные за эти 5-10 секунд</li>
+</ul>
+
+Полезные файлы: <br />
+Скрипт для отображения дерева: <a href="http://profiler.public.oemtest.ru/files/index.php">index.php</a><br />
+MySQL скрипт для преобразования данных <a href="http://profiler.public.oemtest.ru/files/cron.sql">cron.sql</a><br />
+<a href="http://profiler.public.oemtest.ru/files/PinbaClient.class.php">PinbaClient.class.php</a> - обертка над pinba для более удобного использования с автоматическим добавлением tree_id, tree_parent_id<br />
+
+Так же хочется упомянуть фреймворк <a href="https://github.com/onPHP/onphp-framework">onphp</a>, в котором есть нативная поддержка pinba<br />
+
+<a href="http://profiler.public.oemtest.ru/files/">http://profiler.public.oemtest.ru/files/</a> - исходные файлы, чтобы поднять все у себя<br />
+<a href="http://pinba.org/">http://pinba.org/</a> - тут можно скачать pinba<br />
+<br /></br >
+Дисклаймер: Данная статья носит популярный характер и не может рассматриваться как руководство к действию. Все действия, описанные ниже не есть истина в последней инстанции, а скорее один из немногих способов сделать визуализацию информации из pinba
+</div>
